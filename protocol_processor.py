@@ -275,9 +275,13 @@ def extract_pdf(archive: Path, log: logging.Logger = None) -> Path:
     if not pdfs:
         raise RuntimeError("В архиве нет PDF-файлов")
 
-    # Ищем "протокол" без учёта регистра, только кириллица.
-    kw = PROTOCOL_KEYWORD.lower()
-    matches = [p for p in pdfs if kw in p.name.lower()]
+    # Ищем "протокол" без учёта регистра, допуская опечатки в имени
+    # (например 'Проткол' - без одной буквы).
+    def _is_protocol_pdf(name: str) -> bool:
+        n = re.sub(r"\s+", "", name).lower()
+        return bool(re.search(r"протокол|проткол|прот[ао]?кол", n))
+
+    matches = [p for p in pdfs if _is_protocol_pdf(p.name)]
 
     if len(matches) == 0:
         log.error("PDF с '%s' в имени не найден. Все файлы в архиве:",
@@ -365,7 +369,20 @@ def _find_protocol_number(pages: list, log: logging.Logger,
         log.warning("Кандидатов на стр.1 нет - беру номер из имени файла: №%s "
                     "(ОБЯЗАТЕЛЬНО сверь с PDF на пилоте)", fname_num)
         return fname_num
-
+    # Кандидаты в окне вокруг 'регистрации/выдачи протокола' (номер в той же строке таблицы)
+    label_cands = []
+    for lm in re.finditer(r"регистрации\s+протокола|выдачи\s+протокола",
+                          flat1, re.IGNORECASE):
+        window = flat1[max(0, lm.start() - 60):lm.end() + 60]
+        for nm in re.finditer(r"№?\s*(\d{1,4})(?!\d)", window):
+            label_cands.append(nm.group(1))
+    if fname_num and fname_num in label_cands:
+        log.info("Номер подтверждён рядом с меткой даты: №%s", fname_num)
+        return fname_num
+    if len(set(label_cands)) == 1:
+        log.warning("Единственный кандидат у метки даты: №%s (сверь на пилоте)",
+                    label_cands[0])
+        return label_cands[0]
     for label, rx in (("Номер акта измерений", r".{0,60}омер\s*акта.{0,60}"),
                       ("протокол", r".{0,60}ротокол.{0,60}")):
         m = re.search(rx, flat1, re.IGNORECASE)
@@ -382,21 +399,40 @@ def ocr_extract(pdf_path: Path, log: logging.Logger = None,
 
     pages = _ocr_pdf(pdf_path, log, debug)
 
-    # Дата: сначала стр.1, при неудаче - весь документ
+    # Дата: сначала привязанная к 'регистрации/выдачи протокола',
+    # затем - первая попавшаяся (запасной вариант).
     date = None
     for scope in (pages[:1], pages):
         flat = " ".join(" ".join(p.split()) for p in scope)
-        m = DATE_RE.search(flat)
-        if m:
-            month_num = MONTHS.get(m.group(2).lower())
-            if month_num:
-                date = f"{int(m.group(1)):02d}.{month_num}.{m.group(3)}"
+        for label_rx in (r"регистрации\s+протокола", r"выдачи\s+протокола"):
+            for lm in re.finditer(label_rx, flat, re.IGNORECASE):
+                m = DATE_RE.search(flat[lm.end():lm.end() + 60])
+                if m:
+                    month_num = MONTHS.get(m.group(2).lower())
+                    if month_num:
+                        date = f"{int(m.group(1)):02d}.{month_num}.{m.group(3)}"
+                        break
+            if date:
                 break
+        if date is None:
+            m = DATE_RE.search(flat)
+            if m:
+                month_num = MONTHS.get(m.group(2).lower())
+                if month_num:
+                    date = f"{int(m.group(1)):02d}.{month_num}.{m.group(3)}"
+        if date:
+            break
     if date is None:
         flat = " ".join(" ".join(p.split()) for p in pages)
         raise RuntimeError(f"Дата не распознана. Фрагмент: %.300s" % flat)
 
-    number = _find_protocol_number(pages, log, pdf_path=pdf_path)
+    try:
+        number = _find_protocol_number(pages, log, pdf_path=pdf_path)
+    except RuntimeError:
+        # Номер не распознан - по договорённости пишем только дату.
+        log.warning("Номер протокола не распознан - в Pool будет записана "
+                    "только дата: %s", date)
+        return None, date
     log.info("Распознано: №%s от %s", number, date)
     return number, date
 
@@ -486,7 +522,7 @@ def main() -> None:
         log.info("=== ПАКЕТ %d–%d из %d ===",
                  start + 1, start + len(batch), total)
 
-        # 1. Скачивание архива пакета (с паузами внутри)
+        # 1. Скачивание архива пакета
         downloaded = download_archives(session, batch, log)
         failed += len(batch) - len(downloaded)
 
@@ -507,13 +543,16 @@ def main() -> None:
             try:
                 number, date = ocr_extract(t["pdf"], log, args.debug)
                 row = pool_state[t["bs"]]["pool_row"]
-                results.append((row, f"№{number} {date}"))
+                if number:
+                    results.append((row, f"№{number} {date}"))
+                else:
+                    results.append((row, date))  # только дата
             except Exception as e:
                 log.error("BS=%s (SEC стр.%s): OCR не удался - %s",
                           t["bs"], t["sec_row"], e)
                 failed += 1
 
-        # 4. Запись результатов пакета (<= 10 строк, одно открытие файла)
+        # 4. Запись результатов пакета
         if results:
             try:
                 written_total += write_results(results, log)
@@ -533,71 +572,6 @@ def main() -> None:
              written_total, failed, total)
     log.info("=== Готово. ===")
 
-    # Проверка сессии: пробуем первую ссылку, если не rar - сообщаем и выходим.
-    downloaded = download_archives(session, pending, log)
-
-    downloaded = download_archives(session, pending, log)
-
-    # Этап 4: распаковка и выбор PDF с "протокол"
-    pdf_tasks = []
-    for t in downloaded:
-        try:
-            pdf = extract_pdf(t["archive"], log)
-            t["pdf"] = pdf
-            pdf_tasks.append(t)
-        except Exception as e:
-            log.error("BS=%s (SEC стр.%s): архив не обработан - %s",
-                      t["bs"], t["sec_row"], e)
-
-    log.info("Архивов распаковано, PDF выбран: %d из %d",
-             len(pdf_tasks), len(downloaded))
-
-    log.info("Архивов распаковано, PDF выбран: %d из %d",
-             len(pdf_tasks), len(downloaded))
-
-    # Этап 5: OCR и извлечение номера/даты
-    for t in pdf_tasks:
-        try:
-            number, date = ocr_extract(t["pdf"], log, args.debug)
-            t["number"], t["date"] = number, date
-        except Exception as e:
-            log.error("BS=%s (SEC стр.%s): OCR не удался - %s",
-                      t["bs"], t["sec_row"], e)
-
-    ok = [t for t in pdf_tasks if "number" in t]
-    log.info("OCR успешен: %d из %d", len(ok), len(pdf_tasks))
-
-    # Этап 6 (вариант Б): запись пакетами по 10 с сохранением после каждого -
-    # при сбое обработанное уже в файле, повторный запуск продолжит дальше.
-    buffer = []
-    written_total = 0
-    for t in ok:
-        buffer.append((pool_state[t["bs"]]["pool_row"],
-                       f"№{t['number']} {t['date']}"))
-        if len(buffer) >= BATCH_SIZE:
-            try:
-                written_total += write_results(buffer, log)
-            except PermissionError:
-                log.error("Pool.xlsx ЗАКРЫТ В EXCEL? Блок из %d строк не записан.",
-                          len(buffer))
-                raise SystemExit(1)
-            buffer = []
-    if buffer:  # хвост пакета
-        try:
-            written_total += write_results(buffer, log)
-        except PermissionError:
-            log.error("Pool.xlsx ЗАКРЫТ В EXCEL? Блок из %d строк не записан.",
-                      len(buffer))
-            raise SystemExit(1)
-
-    cleanup_temp(log)
-
-    # Итоговая сводка
-    errors = len(pending) - written_total
-    log.info("=== ИТОГИ: обработано %d, ошибок/пропусков %d, всего задач %d ===",
-             written_total, errors, len(pending))
-
-    log.info("=== Этап 6 завершён. ===")
 
 if __name__ == "__main__":
     main()
